@@ -1,11 +1,7 @@
-import { DataAPIClient } from "@datastax/astra-db-ts";
-import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import * as cheerio from "cheerio";
-import "dotenv/config";
-
-console.log("ASTRA_DB_API:", process.env.ASTRA_DB_API);
+import { GoogleGenerativeAIStream, StreamingTextResponse } from "ai";
+import { DataAPIClient } from "@datastax/astra-db-ts";
+import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
 
 const {
   ASTRA_DB_NAMESPACE,
@@ -15,78 +11,95 @@ const {
   GEMINI_API_KEY,
 } = process.env;
 
-const geminiAi = new GoogleGenerativeAI(GEMINI_API_KEY);
+// ✅ Gemini for chat
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY!);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-type similarityMetric = "dot_product" | "cosine" | "euclidean";
+// ✅ AstraDB client
+const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN!);
+const db = client.db(ASTRA_DB_API!, { keyspace: ASTRA_DB_NAMESPACE });
 
-const f1Data = ["https://en.wikipedia.org/wiki/Formula_One"];
-
-const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN);
-const db = client.db(ASTRA_DB_API, { keyspace: ASTRA_DB_NAMESPACE });
-
-const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 512,
-  chunkOverlap: 100,
+// ✅ Ollama embeddings
+const ollamaEmbeddings = new OllamaEmbeddings({
+  model: "nomic-embed-text", // must match what you used when inserting
 });
 
-// ✅ Clean HTML with cheerio
-const cleanHTML = (html: string): string => {
-  const $ = cheerio.load(html);
-  return $("body").text().replace(/\s+/g, " ").trim(); // collapse spaces
-};
+export async function POST(req: Request) {
+  try {
+    const { messages } = await req.json();
+    const latestMessage = messages[messages?.length - 1]?.content;
+    console.log("📩 User latest message:", latestMessage);
 
-// ✅ Scrape & clean page
-const scrapePage = async (url: string): Promise<string> => {
-  const loader = new PuppeteerWebBaseLoader(url, {
-    launchOptions: { headless: true },
-    gotoOptions: { waitUntil: "domcontentloaded" },
-  });
+    let docContext = "";
 
-  const docs = await loader.load();
-  return docs.map((d) => cleanHTML(d.pageContent)).join("\n");
-};
+    // ✅ Use Ollama for embeddings instead of Gemini
+    const embedding = await ollamaEmbeddings.embedQuery(latestMessage);
+    console.log("✅ Got Ollama embedding vector length:", embedding.length);
 
-// ✅ Create Astra collection with correct Gemini dimension (768)
-const createCollection = async (
-  similarityMetric: similarityMetric = "dot_product"
-) => {
-  const res = await db.createCollection(ASTRADB_COLLECTION, {
-    vector: {
-      dimension: 768, // Gemini embedding size
-      metric: similarityMetric,
-    },
-  });
+    try {
+      const collection = await db.collection(ASTRADB_COLLECTION!);
 
-  console.log("Collection created:", res);
-};
+      const cursor = collection.find(
+        {},
+        {
+          sort: { $vector: embedding },
+          limit: 10,
+        }
+      );
 
-// ✅ Load sample data with Gemini embeddings
-const loadSampleData = async () => {
-  const collection = await db.collection(ASTRADB_COLLECTION);
+      const documents = await cursor.toArray();
+      console.log("📚 Retrieved documents from DB:", documents?.length);
 
-  for await (const url of f1Data) {
-    console.log("Scraping:", url);
-    const content = await scrapePage(url);
-    const chunks = await splitter.splitText(content);
+      if (documents?.length > 0) {
+        documents.forEach((doc, i) =>
+          console.log(`   [Doc ${i + 1}]`, doc.text?.slice(0, 200), "...")
+        );
+      }
 
-    for await (const chunk of chunks) {
-      const model = geminiAi.getGenerativeModel({ model: "embedding-001" });
-      const result = await model.embedContent(chunk);
-
-      const vector = result.embedding.values; // ✅ correct Gemini format
-
-      const res = await collection.insertOne({
-        text: chunk,
-        $vector: vector,
-        source: url,
-      });
-
-      console.log("Inserted:", res);
+      const docsMap = documents?.map((doc) => doc.text);
+      docContext = JSON.stringify(docsMap);
+    } catch (err) {
+      console.log("❌ DB query error:", err);
     }
+
+    // ✅ System template
+    const template = {
+      role: "system",
+      content: `
+You are an AI healthcare assistant helping community health workers interact with patients.
+Use the context below to understand symptoms, conditions, and relevant patient-friendly questions.
+If the context doesn't include enough information, answer based on general medical knowledge.
+Always generate questions in **non-technical, easy-to-understand language** suitable for patients.
+Do NOT mention whether context was used.
+Format your output in JSON as follows:
+
+----------
+START CONTEXT 
+${docContext}
+END CONTEXT
+QUESTION: ${latestMessage}
+-----`,
+    };
+
+    console.log("📝 Final system prompt prepared:\n", template.content.slice(0, 500), "...");
+
+    // ✅ Chat with Gemini
+    const response = await model.generateContentStream({
+      contents: [
+        { role: "user", parts: [{ text: template.content }] },
+        ...messages.map((msg: any) => ({
+          role: msg.role,
+          parts: [{ text: msg.content }],
+        })),
+      ],
+    });
+
+    console.log("🚀 Streaming response started from Gemini API...");
+    const stream = GoogleGenerativeAIStream(response);
+
+    return new StreamingTextResponse(stream);
+  } catch (error) {
+    console.log("💥 Error in POST querying DB:", error);
+    return new Response("Internal Server Error", { status: 500 });
   }
-
-  console.log("Sample data loaded.");
-};
-
-// Run
-createCollection().then(() => loadSampleData());
+}

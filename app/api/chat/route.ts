@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleGenerativeAIStream, StreamingTextResponse } from "ai";
 import { DataAPIClient } from "@datastax/astra-db-ts";
+import ollama from "ollama";
 
 // Load env vars
 const {
@@ -14,7 +15,7 @@ const {
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY!);
 
-// Choose model (Gemini 1.5 Pro is common for chat)
+// Choose model (Gemini 1.5 Pro or Flash for chat)
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 // AstraDB client
@@ -32,12 +33,19 @@ export async function POST(req: Request) {
 
     let docContext = "";
 
-    // Embedding
-    const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
-    const embeddingResp = await embeddingModel.embedContent(latestMessage);
-    const embedding = embeddingResp.embedding;
+    // Embedding with Ollama
+    let embedding: number[] = [];
+    try {
+      const embedResp = await ollama.embeddings({
+        model: "nomic-embed-text", 
+        prompt: latestMessage,
+      });
 
-    console.log("✅ Got embedding vector of length:", embedding.values.length);
+      embedding = embedResp.embedding;
+      console.log("✅ Got Ollama embedding vector of length:", embedding.length);
+    } catch (err) {
+      console.error("❌ Ollama embedding error:", err);
+    }
 
     try {
       const collection = await db.collection(ASTRADB_COLLECTION!);
@@ -46,7 +54,7 @@ export async function POST(req: Request) {
         {},
         {
           sort: {
-            $vector: embedding.values,
+            $vector: embedding,
           },
           limit: 10,
         }
@@ -69,13 +77,22 @@ export async function POST(req: Request) {
 
     // Template system prompt
     const template = {
-      role: "system",
-      content: `
-You are an AI assistant who knows everything about Formula One.
-Use the context below to augment what you know about Formula One racing.
-If the context doesn't include the information you need, answer from your existing knowledge.
+  role: "system",
+  content: `
+You are an AI healthcare assistant helping community health workers interact with patients.
+Use the context below to understand symptoms, conditions, and relevant patient-friendly questions.
+If the context doesn't include enough information, answer based on general medical knowledge.
+Always generate questions in **non-technical, easy-to-understand language** suitable for patients.
 Do NOT mention whether context was used.
-Format responses in markdown when applicable.
+
+ You must respond ONLY in the following format. 
+
+Question 1: <your first question>
+Question 2: <your second question>
+Question 3: <your third question>
+
+
+Here is the context you can use to generate a relevant question for the patient:
 
 ----------
 START CONTEXT 
@@ -83,11 +100,11 @@ ${docContext}
 END CONTEXT
 QUESTION: ${latestMessage}
 -----`,
-    };
+};
 
     console.log("📝 Final system prompt prepared:\n", template.content.slice(0, 500), "...");
 
-    // Streaming
+    // Streaming Gemini response
     const response = await model.generateContentStream({
       contents: [
         { role: "user", parts: [{ text: template.content }] },
