@@ -16,7 +16,7 @@ const {
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY!);
 
 // Choose model (Gemini 1.5 Pro or Flash for chat)
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
 // AstraDB client
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN!);
@@ -104,17 +104,17 @@ QUESTION: ${latestMessage}
 
     console.log("📝 Final system prompt prepared:\n", template.content.slice(0, 500), "...");
 
-    // Streaming Gemini response
-    const response = await model.generateContentStream({
-      contents: [
-        { role: "user", parts: [{ text: template.content }] },
-        ...messages.map((msg: any) => ({
-          role: msg.role,
-          parts: [{ text: msg.content }],
-        })),
+const response = await model.generateContentStream({
+  contents: [
+    {
+      role: "user",
+      parts: [
+        { text: template.content }, // system prompt embedded here
+        ...messages.map((msg: any) => ({ text: msg.content })),
       ],
-    });
-
+    },
+  ],
+});
     console.log("🚀 Streaming response started from Gemini API...");
 
     const stream = GoogleGenerativeAIStream(response);
